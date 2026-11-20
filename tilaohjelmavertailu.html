@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+<meta charset="utf-8">
+<title>Tietoa tilaohjelmavertailu (prototyyppi)</title>
+<style>
+body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#222}
+h1{font-size:20px} h2{font-size:16px;margin-top:28px}
+.box{border:1px solid #ccc;border-radius:6px;padding:12px 16px;margin:10px 0;background:#fafafa}
+label{display:inline-block;min-width:150px;font-weight:600}
+select,input[type=file]{margin:4px 0}
+#status{font-style:italic;color:#555;white-space:pre-wrap}
+table{border-collapse:collapse;font-size:12px;width:100%}
+th,td{border-bottom:1px solid #ddd;padding:3px 6px;text-align:left;vertical-align:top}
+td.n,th.n{text-align:right;white-space:nowrap}
+tr.l1 td{font-weight:700;background:#e9eef5} tr.l2 td{font-weight:600;background:#f4f6f9} tr.tot td{font-weight:700;background:#dde5f0}
+td.g{background:#c9efc9} td.y{background:#fff0b3} td.r{background:#f7c6c6}
+.rooms{color:#555;max-width:360px}
+button{padding:6px 12px;margin-right:8px}
+@media print{.noprint{display:none} body{margin:8px}}
+</style>
+</head>
+<body>
+<h1>Tietoa tilaohjelmavertailu <small>(prototyyppi)</small></h1>
+<div class="box noprint">
+  <div><label>1. Tilaohjelma (CSV)</label><input type="file" id="progFile" accept=".csv,.txt"></div>
+  <div><label>2. ARK-malli (IFC)</label><input type="file" id="ifcFile" accept=".ifc,.ifczip"></div>
+  <div><label>Tilatunnuksen kenttä</label><select id="codeKey"></select></div>
+  <div><label>Pinta-alan kenttä</label><select id="areaKey"></select></div>
+  <div style="margin-top:8px"><button id="csvBtn" disabled>Vie tulos CSV:nä</button><button onclick="window.print()">Tulosta / PDF</button></div>
+  <div id="status">Valitse tilaohjelma ja IFC-malli. Tiedostot käsitellään tässä selaimessa, niitä ei lähetetä mihinkään.</div>
+</div>
+<div id="summary"></div>
+<div id="result"></div>
+<div id="issues"></div>
+
+<script type="module">
+// IFClite ladataan prototyypissä CDN:stä. Tuotantoversiossa: npm install @ifc-lite/parser + bundlaus (Vite).
+const LIB_URLS = [
+  'https://esm.sh/@ifc-lite/parser@10.0.0',
+  'https://cdn.jsdelivr.net/npm/@ifc-lite/parser@10.0.0/+esm'
+];
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const status = t => { $('status').textContent = t; };
+const fmt = (v, d = 2) => v == null || isNaN(v) ? '' : v.toLocaleString('fi-FI', {minimumFractionDigits: d, maximumFractionDigits: d});
+const sgn = (v, d = 2) => v == null || isNaN(v) ? '' : (v > 0 ? '+' : '') + fmt(v, d);
+
+let programme = [];   // {code, name, kpl, tav, tavsum}
+let spaces = [];      // {id, number, longName, texts: Map, nums: Map}
+let lastRows = [];
+let lib = null;
+
+async function loadLib() {
+  if (lib) return lib;
+  let err;
+  for (const u of LIB_URLS) {
+    try { lib = await import(u); return lib; } catch (e) { err = e; }
+  }
+  throw new Error('IFClite-kirjaston lataus epäonnistui: ' + (err && err.message));
+}
+
+// ---------- Tilaohjelma (CSV, erotin ; tai sarkain, desimaalipilkku) ----------
+function splitLine(line, sep) {
+  const out = []; let cur = '', q = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (q) { if (ch === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += ch; }
+    else if (ch === '"') q = true;
+    else if (ch === sep) { out.push(cur); cur = ''; }
+    else cur += ch;
+  }
+  out.push(cur); return out;
+}
+function toNum(s) {
+  if (s == null) return null;
+  const t = String(s).replace(/[\s\u00a0]/g, '').replace(',', '.');
+  if (t === '') return null;
+  const v = Number(t); return isNaN(v) ? null : v;
+}
+function parseProgramme(text) {
+  const lines = text.replace(/^\ufeff/, '').split(/\r?\n/).filter(l => l.trim() !== '');
+  if (!lines.length) throw new Error('Tilaohjelma on tyhjä.');
+  const sep = lines[0].includes(';') ? ';' : '\t';
+  const head = splitLine(lines[0], sep).map(h => h.trim().toLowerCase());
+  const find = fn => head.findIndex(fn);
+  const iCode = find(h => h.includes('tunnus'));
+  const iName = find(h => h.includes('nimi'));
+  const iKpl = find(h => h === 'kpl');
+  const iSum = find(h => h.includes('yht') || h.includes('σ'));
+  const iTav = find(h => h.startsWith('tav') && !(h.includes('yht') || h.includes('σ')));
+  if (iCode < 0) throw new Error('Tilaohjelmasta ei löydy saraketta "Tilatunnus".');
+  if (iTav < 0 && iSum < 0) throw new Error('Tilaohjelmasta ei löydy tavoitepinta-alan saraketta (Tav_m2 tai Tav_yht_m2).');
+  const rows = [];
+  for (const line of lines.slice(1)) {
+    const c = splitLine(line, sep);
+    const code = (c[iCode] || '').trim();
+    if (!code) continue;
+    const kpl = iKpl >= 0 ? toNum(c[iKpl]) : null;
+    const tav = iTav >= 0 ? toNum(c[iTav]) : null;
+    let tavsum = iSum >= 0 ? toNum(c[iSum]) : null;
+    if (tavsum == null && tav != null) tavsum = tav * (kpl ?? 1);
+    rows.push({code, name: iName >= 0 ? (c[iName] || '').trim() : '', kpl, tav, tavsum});
+  }
+  return rows;
+}
+
+// ---------- IFC ----------
+async function readIfc(file) {
+  status('Ladataan IFClite-kirjastoa...');
+  const L = await loadLib();
+  status('Luetaan mallia...');
+  const buf = await file.arrayBuffer();
+  const store = await new L.IfcParser().parseColumnar(buf, {
+    onProgress: p => status('Jäsennetään: ' + (p.phase ?? '') + ' ' + Math.round(p.percent ?? 0) + ' %')
+  });
+  const ids = Array.from(store.entityIndex.byType.get('IFCSPACE') ?? []);
+  const res = [];
+  for (const id of ids) {
+    let a = {};
+    try { a = L.extractEntityAttributesOnDemand(store, id) || {}; } catch (e) {}
+    const texts = new Map(), nums = new Map();
+    const put = (key, v) => {
+      if (v == null || v === '') return;
+      if (typeof v === 'number') nums.set(key, v); else texts.set(key, String(v));
+    };
+    for (const ps of (L.extractPropertiesOnDemand(store, id) || []))
+      for (const p of (ps.properties || [])) put(ps.name + '.' + p.name, p.value);
+    for (const qs of (L.extractQuantitiesOnDemand(store, id) || []))
+      for (const q of (qs.quantities || [])) put(qs.name + '.' + q.name, q.value);
+    res.push({id, number: a.name ?? '', longName: a.longName ?? a.description ?? '', texts, nums});
+  }
+  return {res, schema: store.schemaVersion};
+}
+function fillSelect(sel, field, prefer) {
+  const count = new Map();
+  for (const s of spaces) for (const k of s[field].keys()) count.set(k, (count.get(k) || 0) + 1);
+  const keys = [...count.keys()].sort();
+  sel.innerHTML = keys.map(k => '<option value="' + esc(k) + '">' + esc(k) + ' (' + count.get(k) + ' tilaa)</option>').join('');
+  for (const re of prefer) { const hit = keys.find(k => re.test(k)); if (hit) { sel.value = hit; break; } }
+}
+
+// ---------- Vertailu ----------
+function compute() {
+  if (!programme.length || !spaces.length) return;
+  const codeKey = $('codeKey').value, areaKey = $('areaKey').value;
+  const codes = programme.map(r => r.code);
+  const isLeaf = r => !codes.some(c => c.startsWith(r.code + '.'));
+  const leaf = new Map();
+  for (const r of programme) if (isLeaf(r)) leaf.set(r.code, {bimN: 0, bimA: 0, rooms: []});
+  const noCode = [], unknown = [], noArea = [];
+  for (const s of spaces) {
+    const code = (s.texts.get(codeKey) ?? '').trim();
+    const area = s.nums.get(areaKey);
+    if (!code) { noCode.push(s); continue; }
+    const l = leaf.get(code);
+    if (!l) { unknown.push({s, code}); continue; }
+    if (area == null) noArea.push(s);
+    l.bimN++; l.bimA += area ?? 0; l.rooms.push(s.number);
+  }
+  const agg = pred => {
+    const o = {kpl: 0, tavsum: 0, bimN: 0, bimA: 0};
+    for (const r of programme) if (leaf.has(r.code) && pred(r.code)) {
+      const l = leaf.get(r.code);
+      o.kpl += r.kpl ?? 0; o.tavsum += r.tavsum ?? 0; o.bimN += l.bimN; o.bimA += l.bimA;
+    }
+    return o;
+  };
+  const mk = (code, name, level, o, tav, rooms) => {
+    const ero = o.bimA - o.tavsum;
+    return {code, name, level, kpl: o.kpl, tav, tavsum: o.tavsum, ero, erop: o.tavsum ? ero / o.tavsum * 100 : null,
+            bimN: o.bimN, bimA: o.bimA, rooms: rooms || ''};
+  };
+  const rows = [mk('', 'Tilaohjelma yhteensä', 0, agg(() => true), null)];
+  for (const r of programme) {
+    const level = r.code.split('.').length;
+    if (leaf.has(r.code)) {
+      const l = leaf.get(r.code);
+      rows.push(mk(r.code, r.name, level, {kpl: r.kpl ?? 0, tavsum: r.tavsum ?? 0, bimN: l.bimN, bimA: l.bimA}, r.tav, l.rooms.join(', ')));
+    } else rows.push(mk(r.code, r.name, level, agg(c => c.startsWith(r.code + '.')), null));
+  }
+  lastRows = rows;
+  render(rows, {noCode, unknown, noArea, leafCount: leaf.size});
+}
+function cls(p) { if (p == null) return ''; const a = Math.abs(p); return a <= 5 ? 'g' : a <= 10 ? 'y' : 'r'; }
+function render(rows, x) {
+  const matched = rows[0].bimN;
+  $('summary').innerHTML = '<div class="box">Mallissa ' + spaces.length + ' tilaa (IfcSpace), joista ' + matched +
+    ' yhdistyi tilaohjelman riveihin. Tilaohjelmassa ' + x.leafCount + ' tilariviä.</div>';
+  let h = '<h2>Vertailu</h2><table><tr><th>Tilatunnus</th><th>Tilanimi</th><th>Huonenumerot</th><th class="n">kpl</th><th class="n">Tav. m²</th><th class="n">Tav. Σm²</th><th class="n">Ero m²</th><th class="n">Ero %</th><th class="n">BIM kpl</th><th class="n">BIM Σm²</th></tr>';
+  for (const r of rows) {
+    const leafRow = r.tav != null || r.level >= 3;
+    const tr = r.level === 0 ? 'tot' : (!leafRow && r.level === 1) ? 'l1' : !leafRow ? 'l2' : '';
+    h += '<tr class="' + tr + '"><td>' + esc(r.code) + '</td><td>' + esc(r.name) + '</td><td class="rooms">' + esc(r.rooms) +
+      '</td><td class="n">' + fmt(r.kpl, 0) + '</td><td class="n">' + fmt(r.tav) + '</td><td class="n">' + fmt(r.tavsum) +
+      '</td><td class="n">' + sgn(r.ero) + '</td><td class="n ' + cls(r.erop) + '">' + (r.erop == null ? '' : sgn(r.erop, 1) + ' %') +
+      '</td><td class="n">' + r.bimN + '</td><td class="n">' + fmt(r.bimA) + '</td></tr>';
+  }
+  $('result').innerHTML = h + '</table><p>Värit: vihreä ≤ ±5 %, keltainen ≤ ±10 %, punainen yli ±10 %.</p>';
+  const list = (title, arr, f) => '<h2>' + esc(title) + ' (' + arr.length + ')</h2>' + (arr.length
+    ? '<table><tr><th>Huonenumero</th><th>Nimi</th><th>Tilatunnus</th></tr>' + arr.map(f).join('') + '</table>' : '<p>Ei havaintoja.</p>');
+  const row = (s, code) => '<tr><td>' + esc(s.number) + '</td><td>' + esc(s.longName) + '</td><td>' + esc(code) + '</td></tr>';
+  $('issues').innerHTML =
+    list('Tilat ilman tilatunnusta', x.noCode, s => row(s, '')) +
+    list('Tilat, joiden tunnusta ei ole tilaohjelmassa', x.unknown, u => row(u.s, u.code)) +
+    list('Tilat ilman pinta-alaa valitussa kentässä', x.noArea, s => row(s, ''));
+  $('csvBtn').disabled = false;
+  status('Valmis.');
+}
+function exportCsv() {
+  const d = v => v == null || isNaN(v) ? '' : String(Math.round(v * 100) / 100).replace('.', ',');
+  const q = s => '"' + String(s ?? '').replace(/"/g, '""') + '"';
+  const lines = ['Tilatunnus;Tilanimi;Huonenumerot;kpl;Tav_m2;Tav_yht_m2;Ero_m2;Ero_%;BIM_kpl;BIM_yht_m2'];
+  for (const r of lastRows) lines.push([q(r.code), q(r.name), q(r.rooms), r.kpl, d(r.tav), d(r.tavsum), d(r.ero), d(r.erop), r.bimN, d(r.bimA)].join(';'));
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob(['\ufeff' + lines.join('\r\n')], {type: 'text/csv'}));
+  a.download = 'tilaohjelmavertailu.csv'; a.click();
+}
+
+$('progFile').addEventListener('change', async e => {
+  try {
+    const f = e.target.files[0]; if (!f) return;
+    programme = parseProgramme(await f.text());
+    status('Tilaohjelma luettu: ' + programme.length + ' riviä.');
+    compute();
+  } catch (err) { status('Virhe: ' + err.message); }
+});
+$('ifcFile').addEventListener('change', async e => {
+  try {
+    const f = e.target.files[0]; if (!f) return;
+    const r = await readIfc(f);
+    spaces = r.res;
+    fillSelect($('codeKey'), 'texts', [/tilatunnus/i]);
+    fillSelect($('areaKey'), 'nums', [/NetFloorArea$/i, /GrossFloorArea$/i, /area/i, /ala$/i]);
+    status('Malli luettu (' + (r.schema ?? '') + '): ' + spaces.length + ' tilaa.' + (spaces.length ? '' : ' Mallista ei löytynyt IfcSpace-tiloja.'));
+    compute();
+  } catch (err) { status('Virhe: ' + err.message); }
+});
+$('codeKey').addEventListener('change', compute);
+$('areaKey').addEventListener('change', compute);
+$('csvBtn').addEventListener('click', exportCsv);
+</script>
+</body>
+</html>
