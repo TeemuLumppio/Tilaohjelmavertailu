@@ -2,36 +2,45 @@
 <html lang="fi">
 <head>
 <meta charset="utf-8">
-<title>Tietoa tilaohjelmavertailu (prototyyppi)</title>
+<title>Tietoa tilaohjelmavertailu (prototyyppi 0.3)</title>
 <style>
 body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#222}
 h1{font-size:20px} h2{font-size:16px;margin-top:28px}
 .box{border:1px solid #ccc;border-radius:6px;padding:12px 16px;margin:10px 0;background:#fafafa}
-label{display:inline-block;min-width:150px;font-weight:600}
-select,input[type=file]{margin:4px 0}
+label{display:inline-block;min-width:170px;font-weight:600}
+select,input[type=file]{margin:4px 0;max-width:520px}
 #status{font-style:italic;color:#555;white-space:pre-wrap}
 table{border-collapse:collapse;font-size:12px;width:100%}
 th,td{border-bottom:1px solid #ddd;padding:3px 6px;text-align:left;vertical-align:top}
 td.n,th.n{text-align:right;white-space:nowrap}
 tr.l1 td{font-weight:700;background:#e9eef5} tr.l2 td{font-weight:600;background:#f4f6f9} tr.tot td{font-weight:700;background:#dde5f0}
 td.g{background:#c9efc9} td.y{background:#fff0b3} td.r{background:#f7c6c6}
-.rooms{color:#555;max-width:360px}
+.rooms{color:#555;max-width:320px}
 button{padding:6px 12px;margin-right:8px}
+pre{font-size:11px;background:#f3f3f3;padding:8px;overflow:auto;max-height:320px;white-space:pre-wrap;word-break:break-all}
 @media print{.noprint{display:none} body{margin:8px}}
 </style>
 </head>
 <body>
-<h1>Tietoa tilaohjelmavertailu <small>(prototyyppi)</small></h1>
+<h1>Tietoa tilaohjelmavertailu <small>(prototyyppi 0.3)</small></h1>
 <div class="box noprint">
   <div><label>1. Tilaohjelma (CSV)</label><input type="file" id="progFile" accept=".csv,.txt"></div>
-  <div><label>2. ARK-malli (IFC)</label><input type="file" id="ifcFile" accept=".ifc,.ifczip"></div>
+  <div><label>2. ARK-malli (IFC)</label><input type="file" id="ifcFile" accept=".ifc"></div>
   <div><label>Tilatunnuksen kenttä</label><select id="codeKey"></select></div>
   <div><label>Pinta-alan kenttä</label><select id="areaKey"></select></div>
   <div style="margin-top:8px"><button id="csvBtn" disabled>Vie tulos CSV:nä</button><button onclick="window.print()">Tulosta / PDF</button></div>
   <div id="status">Valitse tilaohjelma ja IFC-malli. Tiedostot käsitellään tässä selaimessa, niitä ei lähetetä mihinkään.</div>
 </div>
+<details class="box noprint" id="diagBox" style="display:none">
+  <summary><b>Diagnostiikka: mitä kenttiä mallin tiloilla on</b></summary>
+  <p><button id="diagCopy">Kopioi diagnostiikka leikepöydälle</button></p>
+  <div id="diagKeys"></div>
+  <h2>Ensimmäisen tilan raakatiedot</h2>
+  <pre id="diagRaw"></pre>
+</details>
 <div id="summary"></div>
 <div id="result"></div>
+<div id="roomsTable"></div>
 <div id="issues"></div>
 
 <script type="module">
@@ -40,27 +49,8 @@ const LIB_URLS = [
   'https://esm.sh/@ifc-lite/parser@10.0.0',
   'https://cdn.jsdelivr.net/npm/@ifc-lite/parser@10.0.0/+esm'
 ];
-const $ = id => document.getElementById(id);
-const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const status = t => { $('status').textContent = t; };
-const fmt = (v, d = 2) => v == null || isNaN(v) ? '' : v.toLocaleString('fi-FI', {minimumFractionDigits: d, maximumFractionDigits: d});
-const sgn = (v, d = 2) => v == null || isNaN(v) ? '' : (v > 0 ? '+' : '') + fmt(v, d);
 
-let programme = [];   // {code, name, kpl, tav, tavsum}
-let spaces = [];      // {id, number, longName, texts: Map, nums: Map}
-let lastRows = [];
-let lib = null;
-
-async function loadLib() {
-  if (lib) return lib;
-  let err;
-  for (const u of LIB_URLS) {
-    try { lib = await import(u); return lib; } catch (e) { err = e; }
-  }
-  throw new Error('IFClite-kirjaston lataus epäonnistui: ' + (err && err.message));
-}
-
-// ---------- Tilaohjelma (CSV, erotin ; tai sarkain, desimaalipilkku) ----------
+// CORE-START
 function splitLine(line, sep) {
   const out = []; let cur = '', q = false;
   for (let i = 0; i < line.length; i++) {
@@ -78,34 +68,130 @@ function toNum(s) {
   if (t === '') return null;
   const v = Number(t); return isNaN(v) ? null : v;
 }
+// Ryhmärivi = rivi, jolla on alarivejä, ei omaa tavoitealaa per tila, ja jonka summa on alarivien summa (tai tyhjä).
+// Muut rivit ovat tilarivejä, vaikka niillä olisi alarivejä (esim. 03.01 ja 03.01.01).
+function classify(rows) {
+  const depth = r => r.code.split('.').length;
+  const sorted = rows.slice().sort((a, b) => depth(b) - depth(a));
+  for (const r of sorted) {
+    const desc = rows.filter(x => x.code.startsWith(r.code + '.'));
+    const dsum = desc.reduce((s, x) => s + (x.isGroup ? 0 : (x.tavsum || 0)), 0);
+    r.isGroup = desc.length > 0 && r.tav == null && (r.tavsum == null || Math.abs(r.tavsum - dsum) < 0.02);
+  }
+  return rows;
+}
 function parseProgramme(text) {
   const lines = text.replace(/^\ufeff/, '').split(/\r?\n/).filter(l => l.trim() !== '');
   if (!lines.length) throw new Error('Tilaohjelma on tyhjä.');
   const sep = lines[0].includes(';') ? ';' : '\t';
   const head = splitLine(lines[0], sep).map(h => h.trim().toLowerCase());
   const find = fn => head.findIndex(fn);
+  const isSum = h => h.includes('yht') || h.includes('σ');
   const iCode = find(h => h.includes('tunnus'));
   const iName = find(h => h.includes('nimi'));
   const iKpl = find(h => h === 'kpl');
-  const iSum = find(h => h.includes('yht') || h.includes('σ'));
-  const iTav = find(h => h.startsWith('tav') && !(h.includes('yht') || h.includes('σ')));
+  const iSum = find(isSum);
+  const iTav = find(h => h.startsWith('tav') && !isSum(h));
   if (iCode < 0) throw new Error('Tilaohjelmasta ei löydy saraketta "Tilatunnus".');
   if (iTav < 0 && iSum < 0) throw new Error('Tilaohjelmasta ei löydy tavoitepinta-alan saraketta (Tav_m2 tai Tav_yht_m2).');
-  const rows = [];
+  const rows = [], seen = new Set(), dups = [];
   for (const line of lines.slice(1)) {
     const c = splitLine(line, sep);
     const code = (c[iCode] || '').trim();
     if (!code) continue;
+    if (seen.has(code)) { dups.push(code); continue; }
+    seen.add(code);
     const kpl = iKpl >= 0 ? toNum(c[iKpl]) : null;
     const tav = iTav >= 0 ? toNum(c[iTav]) : null;
     let tavsum = iSum >= 0 ? toNum(c[iSum]) : null;
     if (tavsum == null && tav != null) tavsum = tav * (kpl ?? 1);
     rows.push({code, name: iName >= 0 ? (c[iName] || '').trim() : '', kpl, tav, tavsum});
   }
+  classify(rows);
+  rows.duplicates = dups;
   return rows;
 }
+function computeComparison(programme, spaces, codeKey, areaKey) {
+  const byCode = new Map(), own = new Map();
+  for (const r of programme) { byCode.set(r.code, r); if (!r.isGroup) own.set(r.code, {n: 0, a: 0, rooms: []}); }
+  const noCode = [], unknown = [], noArea = [], roomRows = [];
+  for (const s of spaces) {
+    const code = String(s.texts.get(codeKey) ?? '').trim();
+    const area = s.nums.get(areaKey);
+    if (!code) { noCode.push({s, code: '', area}); continue; }
+    const o = own.get(code);
+    if (!o) { unknown.push({s, code, area}); continue; }
+    if (area == null) noArea.push({s, code, area});
+    o.n++; o.a += area ?? 0; o.rooms.push(s.number);
+    const r = byCode.get(code);
+    const d = (area != null && r.tav != null) ? area - r.tav : null;
+    roomRows.push({code, name: r.name, number: s.number, longName: s.longName, area: area ?? null, tav: r.tav,
+                   ero: d, erop: (d != null && r.tav) ? d / r.tav * 100 : null});
+  }
+  const agg = pred => {
+    const v = {kpl: 0, tavsum: 0, bimN: 0, bimA: 0};
+    for (const r of programme) if (!r.isGroup && pred(r.code)) {
+      const o = own.get(r.code);
+      v.kpl += r.kpl ?? 0; v.tavsum += r.tavsum ?? 0; v.bimN += o.n; v.bimA += o.a;
+    }
+    return v;
+  };
+  const mk = (code, name, level, isGroup, v, tav, rooms) => {
+    const ero = v.bimA - v.tavsum;
+    return {code, name, level, isGroup, kpl: v.kpl, tav, tavsum: v.tavsum, bimN: v.bimN, bimA: v.bimA,
+            eroN: v.bimN - v.kpl, ero, erop: v.tavsum ? ero / v.tavsum * 100 : null, rooms: rooms || ''};
+  };
+  const rows = [mk('', 'Tilaohjelma yhteensä', 0, true, agg(() => true), null)];
+  for (const r of programme) {
+    const level = r.code.split('.').length;
+    if (r.isGroup) rows.push(mk(r.code, r.name, level, true, agg(c => c.startsWith(r.code + '.')), null));
+    else {
+      const o = own.get(r.code);
+      rows.push(mk(r.code, r.name, level, false, {kpl: r.kpl ?? 0, tavsum: r.tavsum ?? 0, bimN: o.n, bimA: o.a}, r.tav, o.rooms.join(', ')));
+    }
+  }
+  roomRows.sort((a, b) => a.code.localeCompare(b.code) || String(a.number).localeCompare(String(b.number), 'fi', {numeric: true}));
+  return {rows, roomRows, noCode, unknown, noArea, spaceRowCount: own.size};
+}
+// CORE-END
 
-// ---------- IFC ----------
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const status = t => { $('status').textContent = t; };
+const fmt = (v, d = 2) => v == null || isNaN(v) ? '' : v.toLocaleString('fi-FI', {minimumFractionDigits: d, maximumFractionDigits: d});
+const sgn = (v, d = 2) => v == null || isNaN(v) ? '' : (v > 0 ? '+' : '') + fmt(v, d);
+
+let programme = [];   // {code, name, kpl, tav, tavsum, isGroup}
+let spaces = [];      // {id, number, longName, texts: Map, nums: Map}
+let last = null;
+let lib = null;
+let diagText = '';
+
+async function loadLib() {
+  if (lib) return lib;
+  let err;
+  for (const u of LIB_URLS) {
+    try { lib = await import(u); return lib; } catch (e) { err = e; }
+  }
+  throw new Error('IFClite-kirjaston lataus epäonnistui: ' + (err && err.message));
+}
+
+// Arvon poiminta: kirjaston palauttama muoto voi vaihdella, joten kokeillaan useita kenttänimiä.
+function rawVal(o) {
+  if (o == null || typeof o !== 'object') return o;
+  let v = o.value ?? o.nominalValue ?? o.areaValue ?? o.lengthValue ?? o.volumeValue ?? o.countValue ?? o.weightValue;
+  if (v != null && typeof v === 'object' && !Array.isArray(v)) v = v.value ?? v.nominalValue;
+  return v;
+}
+const AREA_NAME = /area|ala|m2|m²|netto|brutto/i;
+const NUM_STR = /^\s*(-?\d+(?:[.,]\d+)?)\s*(m2|m²|m\^2)?\s*$/i;
+const safeJson = (o, max) => {
+  let s;
+  try { s = JSON.stringify(o, (k, v) => typeof v === 'bigint' ? Number(v) : v, 1); } catch (e) { s = 'Ei voitu tulostaa: ' + e.message; }
+  if (s == null) s = String(o);
+  return s.length > max ? s.slice(0, max) + '\n... (katkaistu)' : s;
+};
+
 async function readIfc(file) {
   status('Ladataan IFClite-kirjastoa...');
   const L = await loadLib();
@@ -115,103 +201,118 @@ async function readIfc(file) {
     onProgress: p => status('Jäsennetään: ' + (p.phase ?? '') + ' ' + Math.round(p.percent ?? 0) + ' %')
   });
   const ids = Array.from(store.entityIndex.byType.get('IFCSPACE') ?? []);
-  const res = [];
+  const res = [], errors = new Set();
+  let raw = null;
+  const call = (name, id) => {
+    try { return typeof L[name] === 'function' ? (L[name](store, id) || []) : (errors.add(name + ' puuttuu kirjastosta'), []); }
+    catch (e) { errors.add(name + ': ' + e.message); return []; }
+  };
   for (const id of ids) {
-    let a = {};
-    try { a = L.extractEntityAttributesOnDemand(store, id) || {}; } catch (e) {}
+    let a = call('extractEntityAttributesOnDemand', id);
+    if (Array.isArray(a)) a = {};
     const texts = new Map(), nums = new Map();
     const put = (key, v) => {
       if (v == null || v === '') return;
-      if (typeof v === 'number') nums.set(key, v); else texts.set(key, String(v));
+      if (typeof v === 'bigint') v = Number(v);
+      if (typeof v === 'number') { nums.set(key, v); return; }
+      if (typeof v === 'boolean') { texts.set(key, String(v)); return; }
+      const s = String(v);
+      texts.set(key, s);
+      // Numero tekstinä (esim. "59,58 m2"): hyväksytään pinta-alaksi, jos yksikkö on m2 tai kentän nimi viittaa alaan
+      const m = NUM_STR.exec(s);
+      if (m && (m[2] || AREA_NAME.test(key))) nums.set(key, Number(m[1].replace(',', '.')));
     };
-    for (const ps of (L.extractPropertiesOnDemand(store, id) || []))
-      for (const p of (ps.properties || [])) put(ps.name + '.' + p.name, p.value);
-    for (const qs of (L.extractQuantitiesOnDemand(store, id) || []))
-      for (const q of (qs.quantities || [])) put(qs.name + '.' + q.name, q.value);
+    // IfcSpacen omat attribuutit ovat myös valittavissa tunnuskentäksi (jos tunnus on esim. Name-kentässä)
+    put('Attribuutti.Name', a.name); put('Attribuutti.LongName', a.longName);
+    put('Attribuutti.Description', a.description); put('Attribuutti.ObjectType', a.objectType);
+    const psets = call('extractPropertiesOnDemand', id);
+    const qsets = call('extractQuantitiesOnDemand', id);
+    for (const ps of (Array.isArray(psets) ? psets : []))
+      for (const p of (ps.properties || ps.quantities || [])) put((ps.name ?? '?') + '.' + (p.name ?? '?'), rawVal(p));
+    for (const qs of (Array.isArray(qsets) ? qsets : []))
+      for (const q of (qs.quantities || qs.properties || [])) put((qs.name ?? '?') + '.' + (q.name ?? '?'), rawVal(q));
+    if (!raw) raw = {attribuutit: a, propertySetit: psets, maaratiedot: qsets};
     res.push({id, number: a.name ?? '', longName: a.longName ?? a.description ?? '', texts, nums});
   }
-  return {res, schema: store.schemaVersion};
+  return {res, schema: store.schemaVersion, raw, errors: [...errors]};
 }
-function fillSelect(sel, field, prefer) {
-  const count = new Map();
-  for (const s of spaces) for (const k of s[field].keys()) count.set(k, (count.get(k) || 0) + 1);
-  const keys = [...count.keys()].sort();
-  sel.innerHTML = keys.map(k => '<option value="' + esc(k) + '">' + esc(k) + ' (' + count.get(k) + ' tilaa)</option>').join('');
+function keyStats(field) {
+  const m = new Map();
+  for (const s of spaces) for (const [k, v] of s[field]) { const o = m.get(k) || {n: 0, ex: v}; o.n++; m.set(k, o); }
+  return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+}
+function fillSelect(sel, field, prefer, emptyLabel) {
+  const st = keyStats(field), keys = st.map(e => e[0]);
+  sel.innerHTML = (emptyLabel ? '<option value="">' + esc(emptyLabel) + '</option>' : '') +
+    st.map(([k, o]) => '<option value="' + esc(k) + '">' + esc(k) + ' (' + o.n + ' tilaa, esim. ' + esc(String(o.ex).slice(0, 30)) + ')</option>').join('');
   for (const re of prefer) { const hit = keys.find(k => re.test(k)); if (hit) { sel.value = hit; break; } }
 }
+function showDiag(r) {
+  const t = keyStats('texts'), n = keyStats('nums');
+  const tab = (title, st) => '<h2>' + title + ' (' + st.length + ')</h2>' + (st.length
+    ? '<table><tr><th>Kenttä</th><th class="n">Tiloja</th><th>Esimerkkiarvo</th></tr>' + st.map(([k, o]) =>
+      '<tr><td>' + esc(k) + '</td><td class="n">' + o.n + '</td><td>' + esc(String(o.ex).slice(0, 80)) + '</td></tr>').join('') + '</table>'
+    : '<p>Ei yhtään.</p>');
+  $('diagKeys').innerHTML = (r.errors.length ? '<p><b>Lukuvirheet:</b> ' + esc(r.errors.join(' | ')) + '</p>' : '') +
+    tab('Numeeriset kentät (kelpaavat pinta-alaksi)', n) + tab('Tekstikentät (kelpaavat tilatunnukseksi)', t);
+  const rawTxt = safeJson(r.raw, 8000);
+  $('diagRaw').textContent = rawTxt;
+  diagText = 'Skeema: ' + r.schema + '\nTiloja: ' + spaces.length + '\nVirheet: ' + r.errors.join(' | ') +
+    '\n\nNUMEERISET:\n' + n.map(([k, o]) => k + ' (' + o.n + ') = ' + o.ex).join('\n') +
+    '\n\nTEKSTIT:\n' + t.map(([k, o]) => k + ' (' + o.n + ') = ' + String(o.ex).slice(0, 80)).join('\n') +
+    '\n\nRAAKA:\n' + rawTxt;
+  $('diagBox').style.display = '';
+  if (!n.length) $('diagBox').open = true;
+}
 
-// ---------- Vertailu ----------
 function compute() {
   if (!programme.length || !spaces.length) return;
-  const codeKey = $('codeKey').value, areaKey = $('areaKey').value;
-  const codes = programme.map(r => r.code);
-  const isLeaf = r => !codes.some(c => c.startsWith(r.code + '.'));
-  const leaf = new Map();
-  for (const r of programme) if (isLeaf(r)) leaf.set(r.code, {bimN: 0, bimA: 0, rooms: []});
-  const noCode = [], unknown = [], noArea = [];
-  for (const s of spaces) {
-    const code = (s.texts.get(codeKey) ?? '').trim();
-    const area = s.nums.get(areaKey);
-    if (!code) { noCode.push(s); continue; }
-    const l = leaf.get(code);
-    if (!l) { unknown.push({s, code}); continue; }
-    if (area == null) noArea.push(s);
-    l.bimN++; l.bimA += area ?? 0; l.rooms.push(s.number);
-  }
-  const agg = pred => {
-    const o = {kpl: 0, tavsum: 0, bimN: 0, bimA: 0};
-    for (const r of programme) if (leaf.has(r.code) && pred(r.code)) {
-      const l = leaf.get(r.code);
-      o.kpl += r.kpl ?? 0; o.tavsum += r.tavsum ?? 0; o.bimN += l.bimN; o.bimA += l.bimA;
-    }
-    return o;
-  };
-  const mk = (code, name, level, o, tav, rooms) => {
-    const ero = o.bimA - o.tavsum;
-    return {code, name, level, kpl: o.kpl, tav, tavsum: o.tavsum, ero, erop: o.tavsum ? ero / o.tavsum * 100 : null,
-            bimN: o.bimN, bimA: o.bimA, rooms: rooms || ''};
-  };
-  const rows = [mk('', 'Tilaohjelma yhteensä', 0, agg(() => true), null)];
-  for (const r of programme) {
-    const level = r.code.split('.').length;
-    if (leaf.has(r.code)) {
-      const l = leaf.get(r.code);
-      rows.push(mk(r.code, r.name, level, {kpl: r.kpl ?? 0, tavsum: r.tavsum ?? 0, bimN: l.bimN, bimA: l.bimA}, r.tav, l.rooms.join(', ')));
-    } else rows.push(mk(r.code, r.name, level, agg(c => c.startsWith(r.code + '.')), null));
-  }
-  lastRows = rows;
-  render(rows, {noCode, unknown, noArea, leafCount: leaf.size});
+  last = computeComparison(programme, spaces, $('codeKey').value, $('areaKey').value);
+  render(last);
 }
 function cls(p) { if (p == null) return ''; const a = Math.abs(p); return a <= 5 ? 'g' : a <= 10 ? 'y' : 'r'; }
-function render(rows, x) {
-  const matched = rows[0].bimN;
-  $('summary').innerHTML = '<div class="box">Mallissa ' + spaces.length + ' tilaa (IfcSpace), joista ' + matched +
-    ' yhdistyi tilaohjelman riveihin. Tilaohjelmassa ' + x.leafCount + ' tilariviä.</div>';
-  let h = '<h2>Vertailu</h2><table><tr><th>Tilatunnus</th><th>Tilanimi</th><th>Huonenumerot</th><th class="n">kpl</th><th class="n">Tav. m²</th><th class="n">Tav. Σm²</th><th class="n">Ero m²</th><th class="n">Ero %</th><th class="n">BIM kpl</th><th class="n">BIM Σm²</th></tr>';
+function render(x) {
+  const rows = x.rows, sumA = arr => arr.reduce((s, u) => s + (u.area ?? 0), 0);
+  const noAreaKey = !$('areaKey').value;
+  $('summary').innerHTML = '<div class="box">Mallissa ' + spaces.length + ' tilaa (IfcSpace), joista ' + rows[0].bimN +
+    ' yhdistyi tilaohjelman riveihin (' + fmt(rows[0].bimA) + ' m²). Yhdistymättä jäi ' + (x.noCode.length + x.unknown.length) +
+    ' tilaa (' + fmt(sumA(x.noCode) + sumA(x.unknown)) + ' m²). Tilaohjelmassa ' + x.spaceRowCount + ' tilariviä.' +
+    (noAreaKey ? ' <b>Pinta-alakenttää ei ole valittu: vertailussa on vain kappalemäärät, pinta-alasarakkeet eivät ole käytössä.</b>' : '') + '</div>';
+  let h = '<h2>Vertailu tilaohjelman riveittäin</h2><table><tr><th>Tilatunnus</th><th>Tilanimi</th><th>Huonenumerot</th><th class="n">kpl</th><th class="n">Tav. m²</th><th class="n">Tav. Σm²</th><th class="n">BIM kpl</th><th class="n">Ero kpl</th><th class="n">BIM Σm²</th><th class="n">Ero m²</th><th class="n">Ero %</th></tr>';
   for (const r of rows) {
-    const leafRow = r.tav != null || r.level >= 3;
-    const tr = r.level === 0 ? 'tot' : (!leafRow && r.level === 1) ? 'l1' : !leafRow ? 'l2' : '';
+    const tr = r.level === 0 ? 'tot' : (r.isGroup && r.level === 1) ? 'l1' : r.isGroup ? 'l2' : '';
     h += '<tr class="' + tr + '"><td>' + esc(r.code) + '</td><td>' + esc(r.name) + '</td><td class="rooms">' + esc(r.rooms) +
       '</td><td class="n">' + fmt(r.kpl, 0) + '</td><td class="n">' + fmt(r.tav) + '</td><td class="n">' + fmt(r.tavsum) +
-      '</td><td class="n">' + sgn(r.ero) + '</td><td class="n ' + cls(r.erop) + '">' + (r.erop == null ? '' : sgn(r.erop, 1) + ' %') +
-      '</td><td class="n">' + r.bimN + '</td><td class="n">' + fmt(r.bimA) + '</td></tr>';
+      '</td><td class="n">' + r.bimN + '</td><td class="n ' + (r.eroN === 0 ? '' : 'y') + '">' + sgn(r.eroN, 0) +
+      '</td><td class="n">' + (noAreaKey ? '' : fmt(r.bimA)) + '</td><td class="n">' + (noAreaKey ? '' : sgn(r.ero)) +
+      '</td><td class="n ' + (noAreaKey ? '' : cls(r.erop)) + '">' + (noAreaKey || r.erop == null ? '' : sgn(r.erop, 1) + ' %') + '</td></tr>';
   }
-  $('result').innerHTML = h + '</table><p>Värit: vihreä ≤ ±5 %, keltainen ≤ ±10 %, punainen yli ±10 %.</p>';
-  const list = (title, arr, f) => '<h2>' + esc(title) + ' (' + arr.length + ')</h2>' + (arr.length
-    ? '<table><tr><th>Huonenumero</th><th>Nimi</th><th>Tilatunnus</th></tr>' + arr.map(f).join('') + '</table>' : '<p>Ei havaintoja.</p>');
-  const row = (s, code) => '<tr><td>' + esc(s.number) + '</td><td>' + esc(s.longName) + '</td><td>' + esc(code) + '</td></tr>';
+  $('result').innerHTML = h + '</table><p>Värit: vihreä ≤ ±5 %, keltainen ≤ ±10 %, punainen yli ±10 %. Ero kpl korostetaan, jos määrä poikkeaa.</p>';
+  let t = '<h2>Vertailu huoneittain (' + x.roomRows.length + ')</h2><table><tr><th>Tilatunnus</th><th>Tilanimi</th><th>Huonenumero</th><th>Nimi mallissa</th><th class="n">Tav. m²</th><th class="n">BIM m²</th><th class="n">Ero m²</th><th class="n">Ero %</th></tr>';
+  for (const r of x.roomRows)
+    t += '<tr><td>' + esc(r.code) + '</td><td>' + esc(r.name) + '</td><td>' + esc(r.number) + '</td><td>' + esc(r.longName) +
+      '</td><td class="n">' + fmt(r.tav) + '</td><td class="n">' + fmt(r.area) + '</td><td class="n">' + sgn(r.ero) +
+      '</td><td class="n ' + cls(r.erop) + '">' + (r.erop == null ? '' : sgn(r.erop, 1) + ' %') + '</td></tr>';
+  $('roomsTable').innerHTML = t + '</table>';
+  const list = (title, arr) => '<h2>' + esc(title) + ' (' + arr.length + ')</h2>' + (arr.length
+    ? '<table><tr><th>Huonenumero</th><th>Nimi</th><th>Tilatunnus</th><th class="n">m²</th></tr>' + arr.map(u =>
+      '<tr><td>' + esc(u.s.number) + '</td><td>' + esc(u.s.longName) + '</td><td>' + esc(u.code) + '</td><td class="n">' + fmt(u.area) + '</td></tr>').join('') + '</table>'
+    : '<p>Ei havaintoja.</p>');
   $('issues').innerHTML =
-    list('Tilat ilman tilatunnusta', x.noCode, s => row(s, '')) +
-    list('Tilat, joiden tunnusta ei ole tilaohjelmassa', x.unknown, u => row(u.s, u.code)) +
-    list('Tilat ilman pinta-alaa valitussa kentässä', x.noArea, s => row(s, ''));
+    list('Tilat ilman tilatunnusta', x.noCode) +
+    list('Tilat, joiden tunnusta ei ole tilaohjelmassa', x.unknown) +
+    (noAreaKey ? '' : list('Tilat ilman pinta-alaa valitussa kentässä', x.noArea));
   $('csvBtn').disabled = false;
   status('Valmis.');
 }
 function exportCsv() {
+  if (!last) return;
   const d = v => v == null || isNaN(v) ? '' : String(Math.round(v * 100) / 100).replace('.', ',');
   const q = s => '"' + String(s ?? '').replace(/"/g, '""') + '"';
-  const lines = ['Tilatunnus;Tilanimi;Huonenumerot;kpl;Tav_m2;Tav_yht_m2;Ero_m2;Ero_%;BIM_kpl;BIM_yht_m2'];
-  for (const r of lastRows) lines.push([q(r.code), q(r.name), q(r.rooms), r.kpl, d(r.tav), d(r.tavsum), d(r.ero), d(r.erop), r.bimN, d(r.bimA)].join(';'));
+  const na = !$('areaKey').value;
+  const lines = ['Tilatunnus;Tilanimi;Huonenumerot;kpl;Tav_m2;Tav_yht_m2;BIM_kpl;Ero_kpl;BIM_yht_m2;Ero_m2;Ero_%'];
+  for (const r of last.rows) lines.push([q(r.code), q(r.name), q(r.rooms), r.kpl, d(r.tav), d(r.tavsum), r.bimN, r.eroN,
+    na ? '' : d(r.bimA), na ? '' : d(r.ero), na ? '' : d(r.erop)].join(';'));
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob(['\ufeff' + lines.join('\r\n')], {type: 'text/csv'}));
   a.download = 'tilaohjelmavertailu.csv'; a.click();
@@ -221,7 +322,8 @@ $('progFile').addEventListener('change', async e => {
   try {
     const f = e.target.files[0]; if (!f) return;
     programme = parseProgramme(await f.text());
-    status('Tilaohjelma luettu: ' + programme.length + ' riviä.');
+    status('Tilaohjelma luettu: ' + programme.length + ' riviä, joista ' + programme.filter(r => !r.isGroup).length + ' tilariviä.' +
+      (programme.duplicates.length ? ' Ohitettiin toistuvat tunnukset: ' + programme.duplicates.join(', ') : ''));
     compute();
   } catch (err) { status('Virhe: ' + err.message); }
 });
@@ -230,15 +332,24 @@ $('ifcFile').addEventListener('change', async e => {
     const f = e.target.files[0]; if (!f) return;
     const r = await readIfc(f);
     spaces = r.res;
-    fillSelect($('codeKey'), 'texts', [/tilatunnus/i]);
-    fillSelect($('areaKey'), 'nums', [/NetFloorArea$/i, /GrossFloorArea$/i, /area/i, /ala$/i]);
-    status('Malli luettu (' + (r.schema ?? '') + '): ' + spaces.length + ' tilaa.' + (spaces.length ? '' : ' Mallista ei löytynyt IfcSpace-tiloja.'));
+    fillSelect($('codeKey'), 'texts', [/tilatunnus/i, /tunnus/i]);
+    fillSelect($('areaKey'), 'nums', [/NetFloorArea$/i, /GrossFloorArea$/i, /area/i, /ala$/i], '(ei pinta-alaa, vain kappalemäärät)');
+    showDiag(r);
+    const hasNum = spaces.some(s => s.nums.size > 0);
+    status('Malli luettu (' + (r.schema ?? '') + '): ' + spaces.length + ' tilaa.' +
+      (spaces.length ? '' : ' Mallista ei löytynyt IfcSpace-tiloja.') +
+      (spaces.length && !hasNum ? '\nTiloilta ei löytynyt yhtään numeerista kenttää. Avaa Diagnostiikka-laatikko: jos määrätiedot ovat tyhjät, IFC on viety ilman määrätietoja (Base Quantities).' : '') +
+      (r.errors.length ? '\nLukuvirheitä: ' + r.errors.join(' | ') : ''));
     compute();
   } catch (err) { status('Virhe: ' + err.message); }
 });
 $('codeKey').addEventListener('change', compute);
 $('areaKey').addEventListener('change', compute);
 $('csvBtn').addEventListener('click', exportCsv);
+$('diagCopy').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(diagText); status('Diagnostiikka kopioitu leikepöydälle.'); }
+  catch (e) { status('Kopiointi ei onnistunut. Maalaa ja kopioi teksti käsin.'); }
+});
 </script>
 </body>
 </html>
