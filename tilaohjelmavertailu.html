@@ -2,7 +2,7 @@
 <html lang="fi">
 <head>
 <meta charset="utf-8">
-<title>Tietoa tilaohjelmavertailu (prototyyppi 0.6)</title>
+<title>Tietoa tilaohjelmavertailu (prototyyppi 0.7)</title>
 <style>
 body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#222}
 body.drag{outline:4px dashed #3a78c2;outline-offset:-12px;background:#eef5fc}
@@ -20,13 +20,14 @@ td.n,th.n{text-align:right;white-space:nowrap}
 tr.l1 td{font-weight:700;background:#e9eef5} tr.l2 td{font-weight:600;background:#f4f6f9} tr.tot td{font-weight:700;background:#dde5f0}
 td.g{background:#c9efc9} td.y{background:#fff0b3} td.r{background:#f7c6c6}
 .rooms{color:#555;max-width:320px}
+.ms{max-width:260px}
 button{padding:6px 12px;margin-right:8px}
 pre{font-size:11px;background:#f3f3f3;padding:8px;overflow:auto;max-height:320px;white-space:pre-wrap;word-break:break-all}
 @media print{.noprint{display:none} body{margin:8px}}
 </style>
 </head>
 <body>
-<h1>Tietoa tilaohjelmavertailu <small>(prototyyppi 0.6)</small></h1>
+<h1>Tietoa tilaohjelmavertailu <small>(prototyyppi 0.7)</small></h1>
 <div class="box noprint">
   <div class="hint">Pudota tilaohjelma (.csv) ja yksi tai useampi malli (.ifc) mihin tahansa tälle sivulle, tai valitse ne painikkeilla. Mallit lasketaan samaan vertailuun.</div>
   <div><label>1. Tilaohjelma (CSV)</label><input type="file" id="progFile" accept=".csv,.txt"><span class="fname" id="progName"></span></div>
@@ -47,6 +48,7 @@ pre{font-size:11px;background:#f3f3f3;padding:8px;overflow:auto;max-height:320px
   <pre id="diagRaw"></pre>
 </details>
 <div id="summary"></div>
+<div id="msBox"></div>
 <div id="areaBox"></div>
 <div id="result"></div>
 <div id="roomsTable"></div>
@@ -106,8 +108,9 @@ function parseProgramme(text) {
   const iCode = find(h => h.includes('tunnus'));
   const iName = find(h => h.includes('nimi'));
   const iKpl = find(h => h === 'kpl');
-  const iSum = find(isSum);
+  const iSum = find(h => h.startsWith('tav') && isSum(h)) >= 0 ? find(h => h.startsWith('tav') && isSum(h)) : find(isSum);
   const iTav = find(h => h.startsWith('tav') && !isSum(h));
+  const iRooms = find(h => h.includes('huonenumero'));
   if (iCode < 0) throw new Error('Tilaohjelmasta ei löydy saraketta "Tilatunnus". Löytyneet sarakkeet: ' + rawHead.join(' | '));
   if (iTav < 0 && iSum < 0) throw new Error('Tilaohjelmasta ei löydy tavoitepinta-alan saraketta. Löytyneet sarakkeet: ' + rawHead.join(' | '));
   const rows = [], seen = new Set(), dups = [];
@@ -121,11 +124,14 @@ function parseProgramme(text) {
     const tav = iTav >= 0 ? toNum(c[iTav]) : null;
     let tavsum = iSum >= 0 ? toNum(c[iSum]) : null;
     if (tavsum == null && tav != null) tavsum = tav * (kpl ?? 1);
-    rows.push({code, name: iName >= 0 ? (c[iName] || '').trim() : '', kpl, tav, tavsum});
+    // Modelspacen tilaohjelmaraportin sarake Huonenumero: tilat, jotka Modelspace on yhdistänyt riville (erotin ". ")
+    const msRooms = iRooms >= 0 ? (c[iRooms] || '').split(/\.\s+|;\s*/).map(x => x.trim()).filter(x => x !== '') : null;
+    rows.push({code, name: iName >= 0 ? (c[iName] || '').trim() : '', kpl, tav, tavsum, msRooms});
   }
   classify(rows);
   rows.duplicates = dups;
   rows.sep = sep;
+  rows.hasMsRooms = iRooms >= 0 && rows.some(r => r.msRooms && r.msRooms.length > 0);
   return rows;
 }
 // Usean mallin tilat yhdistetään yhdeksi listaksi. Sama tila (sama GlobalId) lasketaan vain kerran.
@@ -155,6 +161,12 @@ function splitAreas(spaces, termsText) {
   if (other.spaces.length) groups.push(other);
   return {rooms, groups, areaCount: groups.reduce((n, g) => n + g.spaces.length, 0)};
 }
+// Vertaa sovelluksen riville yhdistämiä huonenumeroita Modelspacen raportin huonenumeroihin.
+function compareRooms(appRooms, msRooms) {
+  const left = msRooms.slice(), onlyApp = [];
+  for (const a of appRooms) { const v = String(a).trim(); const i = left.indexOf(v); if (i >= 0) left.splice(i, 1); else onlyApp.push(v); }
+  return {ok: !onlyApp.length && !left.length, onlyApp, onlyMs: left};
+}
 function computeComparison(programme, spaces, codeKey, areaKey) {
   const byCode = new Map(), own = new Map();
   for (const r of programme) { byCode.set(r.code, r); if (!r.isGroup) own.set(r.code, {n: 0, a: 0, rooms: []}); }
@@ -183,7 +195,7 @@ function computeComparison(programme, spaces, codeKey, areaKey) {
   const mk = (code, name, level, isGroup, v, tav, rooms) => {
     const ero = v.bimA - v.tavsum;
     return {code, name, level, isGroup, kpl: v.kpl, tav, tavsum: v.tavsum, bimN: v.bimN, bimA: v.bimA,
-            eroN: v.bimN - v.kpl, ero, erop: v.tavsum ? ero / v.tavsum * 100 : null, rooms: rooms || ''};
+            eroN: v.bimN - v.kpl, ero, erop: v.tavsum ? ero / v.tavsum * 100 : null, rooms: rooms || '', ms: null};
   };
   const rows = [mk('', 'Tilaohjelma yhteensä', 0, true, agg(() => true), null)];
   for (const r of programme) {
@@ -191,7 +203,9 @@ function computeComparison(programme, spaces, codeKey, areaKey) {
     if (r.isGroup) rows.push(mk(r.code, r.name, level, true, agg(c => c.startsWith(r.code + '.')), null));
     else {
       const o = own.get(r.code);
-      rows.push(mk(r.code, r.name, level, false, {kpl: r.kpl ?? 0, tavsum: r.tavsum ?? 0, bimN: o.n, bimA: o.a}, r.tav, o.rooms.join(', ')));
+      const row = mk(r.code, r.name, level, false, {kpl: r.kpl ?? 0, tavsum: r.tavsum ?? 0, bimN: o.n, bimA: o.a}, r.tav, o.rooms.join(', '));
+      if (programme.hasMsRooms && r.msRooms) row.ms = compareRooms(o.rooms, r.msRooms);
+      rows.push(row);
     }
   }
   roomRows.sort((a, b) => a.code.localeCompare(b.code) || String(a.number).localeCompare(String(b.number), 'fi', {numeric: true}));
@@ -205,7 +219,7 @@ const status = t => { $('status').textContent = t; };
 const fmt = (v, d = 2) => v == null || isNaN(v) ? '' : v.toLocaleString('fi-FI', {minimumFractionDigits: d, maximumFractionDigits: d});
 const sgn = (v, d = 2) => v == null || isNaN(v) ? '' : (v > 0 ? '+' : '') + fmt(v, d);
 
-let programme = [];   // {code, name, kpl, tav, tavsum, isGroup}
+let programme = [];   // {code, name, kpl, tav, tavsum, isGroup, msRooms}
 let models = [];      // {name, res: [space], schema, raw, errors}
 let spaces = [];      // kaikkien mallien tilat: {gid, model, number, longName, texts: Map, nums: Map}
 let last = null;
@@ -317,7 +331,7 @@ function showDiag() {
 }
 
 function clearOutput() {
-  for (const id of ['summary', 'areaBox', 'result', 'roomsTable', 'issues']) $(id).innerHTML = '';
+  for (const id of ['summary', 'msBox', 'areaBox', 'result', 'roomsTable', 'issues']) $(id).innerHTML = '';
   $('csvBtn').disabled = true; last = null;
 }
 function compute() {
@@ -376,9 +390,16 @@ function renderAreas(sp, areaKey) {
         esc(levelKey ? (s.texts.get(levelKey) ?? '') : '') + '</td><td class="n">' + (hasArea ? fmt(s.nums.get(areaKey)) : '') + '</td></tr>';
   $('areaBox').innerHTML = h + '</table></details>';
 }
+function msText(r) {
+  if (!r.ms) return '';
+  if (r.ms.ok) return 'OK';
+  return (r.ms.onlyApp.length ? 'Vain sovelluksessa: ' + r.ms.onlyApp.join(', ') + '. ' : '') +
+         (r.ms.onlyMs.length ? 'Vain Modelspacessa: ' + r.ms.onlyMs.join(', ') + '.' : '');
+}
 function render(x, sp) {
   const rows = x.rows, sumA = arr => arr.reduce((s, u) => s + (u.area ?? 0), 0);
   const noAreaKey = !$('areaKey').value;
+  const hasMs = !!programme.hasMsRooms;
   $('summary').innerHTML = '<div class="box">Malleja ' + models.length + ' (' + esc(models.map(m => m.name + ': ' + m.res.length + ' tilaa').join(', ')) +
     '). Yhteensä ' + spaces.length + ' tilaa (IfcSpace)' +
     (sp.areaCount ? ', joista ' + sp.areaCount + ' aluetilaa (brutto- ja kerrosalat) on rajattu pois huonevertailusta' : '') +
@@ -386,14 +407,30 @@ function render(x, sp) {
     ' yhdistyi tilaohjelman riveihin (' + fmt(rows[0].bimA) + ' m²). Yhdistymättä jäi ' + (x.noCode.length + x.unknown.length) +
     ' tilaa (' + fmt(sumA(x.noCode) + sumA(x.unknown)) + ' m²). Tilaohjelmassa ' + x.spaceRowCount + ' tilariviä.' +
     (noAreaKey ? ' <b>Pinta-alakenttää ei ole valittu: vertailussa on vain kappalemäärät, pinta-alasarakkeet eivät ole käytössä.</b>' : '') + '</div>';
-  let h = '<h2>Vertailu tilaohjelman riveittäin</h2><table><tr><th>Tilatunnus</th><th>Tilanimi</th><th>Huonenumerot</th><th class="n">kpl</th><th class="n">Tav. m²</th><th class="n">Tav. Σm²</th><th class="n">BIM kpl</th><th class="n">Ero kpl</th><th class="n">BIM Σm²</th><th class="n">Ero m²</th><th class="n">Ero %</th></tr>';
+  if (hasMs) {
+    const msRows = rows.filter(r => r.ms), bad = msRows.filter(r => !r.ms.ok);
+    const nApp = bad.reduce((s, r) => s + r.ms.onlyApp.length, 0), nMs = bad.reduce((s, r) => s + r.ms.onlyMs.length, 0);
+    let m = '<h2>Modelspace-tarkistus</h2><div class="box">Tilaohjelman CSV:ssä on Modelspacen huonenumerosarake, joten sovelluksen yhdistämiä tiloja verrataan siihen. ' +
+      'Huonenumerot täsmäävät <b>' + (msRows.length - bad.length) + '/' + msRows.length + '</b> tilarivillä. ' +
+      (bad.length ? 'Eroja: ' + nApp + ' tilaa vain sovelluksessa, ' + nMs + ' tilaa vain Modelspacessa.' : 'Eroja ei ole.') +
+      ' <span class="hint">Tarkistus vertaa vain sitä, mitkä tilat on yhdistetty millekin riville. Pinta-aloja se ei vertaa, koska tilaohjelmaraportissa ei ole BIM-aloja.</span></div>';
+    if (bad.length) {
+      m += '<table><tr><th>Tilatunnus</th><th>Tilanimi</th><th>Vain sovelluksessa</th><th>Vain Modelspacessa</th></tr>';
+      for (const r of bad) m += '<tr><td>' + esc(r.code) + '</td><td>' + esc(r.name) + '</td><td>' + esc(r.ms.onlyApp.join(', ')) + '</td><td>' + esc(r.ms.onlyMs.join(', ')) + '</td></tr>';
+      m += '</table>';
+    }
+    $('msBox').innerHTML = m;
+  } else $('msBox').innerHTML = '';
+  let h = '<h2>Vertailu tilaohjelman riveittäin</h2><table><tr><th>Tilatunnus</th><th>Tilanimi</th><th>Huonenumerot</th><th class="n">kpl</th><th class="n">Tav. m²</th><th class="n">Tav. Σm²</th><th class="n">BIM kpl</th><th class="n">Ero kpl</th><th class="n">BIM Σm²</th><th class="n">Ero m²</th><th class="n">Ero %</th>' +
+    (hasMs ? '<th>Modelspace</th>' : '') + '</tr>';
   for (const r of rows) {
     const tr = r.level === 0 ? 'tot' : (r.isGroup && r.level === 1) ? 'l1' : r.isGroup ? 'l2' : '';
     h += '<tr class="' + tr + '"><td>' + esc(r.code) + '</td><td>' + esc(r.name) + '</td><td class="rooms">' + esc(r.rooms) +
       '</td><td class="n">' + fmt(r.kpl, 0) + '</td><td class="n">' + fmt(r.tav) + '</td><td class="n">' + fmt(r.tavsum) +
       '</td><td class="n">' + r.bimN + '</td><td class="n ' + (r.eroN === 0 ? '' : 'y') + '">' + sgn(r.eroN, 0) +
       '</td><td class="n">' + (noAreaKey ? '' : fmt(r.bimA)) + '</td><td class="n">' + (noAreaKey ? '' : sgn(r.ero)) +
-      '</td><td class="n ' + (noAreaKey ? '' : cls(r.erop)) + '">' + (noAreaKey || r.erop == null ? '' : sgn(r.erop, 1) + ' %') + '</td></tr>';
+      '</td><td class="n ' + (noAreaKey ? '' : cls(r.erop)) + '">' + (noAreaKey || r.erop == null ? '' : sgn(r.erop, 1) + ' %') + '</td>' +
+      (hasMs ? '<td class="ms ' + (r.ms ? (r.ms.ok ? 'g' : 'r') : '') + '">' + esc(msText(r)) + '</td>' : '') + '</tr>';
   }
   $('result').innerHTML = h + '</table><p>Värit: vihreä ≤ ±5 %, keltainen ≤ ±10 %, punainen yli ±10 %. Ero kpl korostetaan, jos määrä poikkeaa.</p>';
   let t = '<h2>Vertailu huoneittain (' + x.roomRows.length + ')</h2><table><tr><th>Tilatunnus</th><th>Tilanimi</th><th>Malli</th><th>Huonenumero</th><th>Nimi mallissa</th><th class="n">Tav. m²</th><th class="n">BIM m²</th><th class="n">Ero m²</th><th class="n">Ero %</th></tr>';
@@ -416,10 +453,10 @@ function exportCsv() {
   if (!last) return;
   const d = v => v == null || isNaN(v) ? '' : String(Math.round(v * 100) / 100).replace('.', ',');
   const q = s => '"' + String(s ?? '').replace(/"/g, '""') + '"';
-  const na = !$('areaKey').value;
-  const lines = ['Tilatunnus;Tilanimi;Huonenumerot;kpl;Tav_m2;Tav_yht_m2;BIM_kpl;Ero_kpl;BIM_yht_m2;Ero_m2;Ero_%'];
+  const na = !$('areaKey').value, hasMs = !!programme.hasMsRooms;
+  const lines = ['Tilatunnus;Tilanimi;Huonenumerot;kpl;Tav_m2;Tav_yht_m2;BIM_kpl;Ero_kpl;BIM_yht_m2;Ero_m2;Ero_%' + (hasMs ? ';Modelspace_tarkistus' : '')];
   for (const r of last.rows) lines.push([q(r.code), q(r.name), q(r.rooms), r.kpl, d(r.tav), d(r.tavsum), r.bimN, r.eroN,
-    na ? '' : d(r.bimA), na ? '' : d(r.ero), na ? '' : d(r.erop)].join(';'));
+    na ? '' : d(r.bimA), na ? '' : d(r.ero), na ? '' : d(r.erop)].concat(hasMs ? [q(msText(r))] : []).join(';'));
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob(['\ufeff' + lines.join('\r\n')], {type: 'text/csv'}));
   a.download = 'tilaohjelmavertailu.csv'; a.click();
@@ -432,6 +469,7 @@ async function loadProgramme(f) {
     const leaf = programme.filter(r => !r.isGroup);
     status('Tilaohjelma luettu: ' + programme.length + ' riviä, joista ' + leaf.length + ' tilariviä. Yhteensä ' +
       fmt(leaf.reduce((s, r) => s + (r.kpl ?? 0), 0), 0) + ' kpl ja ' + fmt(leaf.reduce((s, r) => s + (r.tavsum ?? 0), 0)) + ' m².' +
+      (programme.hasMsRooms ? ' Tiedostossa on Modelspacen huonenumerosarake, joten Modelspace-tarkistus on käytössä.' : '') +
       (programme.duplicates.length ? ' Ohitettiin toistuvat tunnukset: ' + programme.duplicates.join(', ') : ''));
     compute();
   } catch (err) { status('Virhe tilaohjelmassa: ' + err.message); }
