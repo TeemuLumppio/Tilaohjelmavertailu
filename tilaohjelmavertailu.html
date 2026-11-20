@@ -2,7 +2,7 @@
 <html lang="fi">
 <head>
 <meta charset="utf-8">
-<title>Tietoa tilaohjelmavertailu (prototyyppi 0.5)</title>
+<title>Tietoa tilaohjelmavertailu (prototyyppi 0.6)</title>
 <style>
 body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#222}
 body.drag{outline:4px dashed #3a78c2;outline-offset:-12px;background:#eef5fc}
@@ -26,21 +26,21 @@ pre{font-size:11px;background:#f3f3f3;padding:8px;overflow:auto;max-height:320px
 </style>
 </head>
 <body>
-<h1>Tietoa tilaohjelmavertailu <small>(prototyyppi 0.5)</small></h1>
+<h1>Tietoa tilaohjelmavertailu <small>(prototyyppi 0.6)</small></h1>
 <div class="box noprint">
-  <div class="hint">Pudota tilaohjelma (.csv) ja malli (.ifc) mihin tahansa tälle sivulle, tai valitse ne painikkeilla.</div>
+  <div class="hint">Pudota tilaohjelma (.csv) ja yksi tai useampi malli (.ifc) mihin tahansa tälle sivulle, tai valitse ne painikkeilla. Mallit lasketaan samaan vertailuun.</div>
   <div><label>1. Tilaohjelma (CSV)</label><input type="file" id="progFile" accept=".csv,.txt"><span class="fname" id="progName"></span></div>
-  <div><label>2. ARK-malli (IFC)</label><input type="file" id="ifcFile" accept=".ifc"><span class="fname" id="ifcName"></span></div>
+  <div><label>2. ARK-mallit (IFC)</label><input type="file" id="ifcFile" accept=".ifc" multiple><button id="clearBtn">Tyhjennä mallit</button><span class="fname" id="ifcName"></span></div>
   <div><label>Tilatunnuksen kenttä</label><select id="codeKey"></select></div>
   <div><label>Pinta-alan kenttä</label><select id="areaKey"></select></div>
   <div><label>Kerroksen kenttä</label><select id="levelKey"></select></div>
   <div><label>Aluetilojen hakusanat</label><input type="text" id="areaTerms" value="bruttoala, kerrosala"> <span class="hint">Pilkulla erotettuna. Tilat, joiden nimessä tai numerossa on hakusana, rajataan pois huonevertailusta omaan taulukkoonsa. Myös Revitin Area-tilat tunnistetaan.</span></div>
   <div><label>Tavoitealat (m²)</label><input type="text" id="areaTargets" placeholder="esim. 9500; 8700"> <span class="hint">Valinnainen. Puolipisteellä erotettuna, samassa järjestyksessä kuin hakusanat.</span></div>
   <div style="margin-top:8px"><button id="csvBtn" disabled>Vie tulos CSV:nä</button><button onclick="window.print()">Tulosta / PDF</button></div>
-  <div id="status">Valitse tilaohjelma ja IFC-malli. Tiedostot käsitellään tässä selaimessa, niitä ei lähetetä mihinkään.</div>
+  <div id="status">Valitse tilaohjelma ja IFC-mallit. Tiedostot käsitellään tässä selaimessa, niitä ei lähetetä mihinkään.</div>
 </div>
 <details class="box noprint" id="diagBox" style="display:none">
-  <summary><b>Diagnostiikka: mitä kenttiä mallin tiloilla on</b></summary>
+  <summary><b>Diagnostiikka: mitä kenttiä mallien tiloilla on</b></summary>
   <p><button id="diagCopy">Kopioi diagnostiikka leikepöydälle</button></p>
   <div id="diagKeys"></div>
   <h2>Ensimmäisen tilan raakatiedot</h2>
@@ -128,6 +128,15 @@ function parseProgramme(text) {
   rows.sep = sep;
   return rows;
 }
+// Usean mallin tilat yhdistetään yhdeksi listaksi. Sama tila (sama GlobalId) lasketaan vain kerran.
+function mergeModels(models) {
+  const out = [], seen = new Set(); let dups = 0;
+  for (const m of models) for (const s of m.res) {
+    if (s.gid) { if (seen.has(s.gid)) { dups++; continue; } seen.add(s.gid); }
+    out.push(s);
+  }
+  return {spaces: out, dups};
+}
 // Aluetilat (bruttoala, kerrosala ym.) erotetaan huonetiloista. Hakusana haetaan vain tilan nimestä ja numerosta,
 // ei muista kentistä (esim. arvo "Ei kerrosalaa" ei saa osua). Revitin Area-tilat tunnistetaan kentästä "Area Type".
 function splitAreas(spaces, termsText) {
@@ -160,7 +169,7 @@ function computeComparison(programme, spaces, codeKey, areaKey) {
     o.n++; o.a += area ?? 0; o.rooms.push(s.number);
     const r = byCode.get(code);
     const d = (area != null && r.tav != null) ? area - r.tav : null;
-    roomRows.push({code, name: r.name, number: s.number, longName: s.longName, area: area ?? null, tav: r.tav,
+    roomRows.push({code, name: r.name, number: s.number, longName: s.longName, model: s.model ?? '', area: area ?? null, tav: r.tav,
                    ero: d, erop: (d != null && r.tav) ? d / r.tav * 100 : null});
   }
   const agg = pred => {
@@ -197,7 +206,8 @@ const fmt = (v, d = 2) => v == null || isNaN(v) ? '' : v.toLocaleString('fi-FI',
 const sgn = (v, d = 2) => v == null || isNaN(v) ? '' : (v > 0 ? '+' : '') + fmt(v, d);
 
 let programme = [];   // {code, name, kpl, tav, tavsum, isGroup}
-let spaces = [];      // {id, number, longName, texts: Map, nums: Map}
+let models = [];      // {name, res: [space], schema, raw, errors}
+let spaces = [];      // kaikkien mallien tilat: {gid, model, number, longName, texts: Map, nums: Map}
 let last = null;
 let lib = null;
 let diagText = '';
@@ -230,10 +240,10 @@ const safeJson = (o, max) => {
 async function readIfc(file) {
   status('Ladataan IFClite-kirjastoa...');
   const L = await loadLib();
-  status('Luetaan mallia...');
+  status('Luetaan mallia ' + file.name + '...');
   const buf = await file.arrayBuffer();
   const store = await new L.IfcParser().parseColumnar(buf, {
-    onProgress: p => status('Jäsennetään: ' + (p.phase ?? '') + ' ' + Math.round(p.percent ?? 0) + ' %')
+    onProgress: p => status('Jäsennetään ' + file.name + ': ' + (p.phase ?? '') + ' ' + Math.round(p.percent ?? 0) + ' %')
   });
   const ids = Array.from(store.entityIndex.byType.get('IFCSPACE') ?? []);
   const res = [], errors = new Set();
@@ -267,41 +277,51 @@ async function readIfc(file) {
     for (const qs of (Array.isArray(qsets) ? qsets : []))
       for (const q of (qs.quantities || qs.properties || [])) put((qs.name ?? '?') + '.' + (q.name ?? '?'), rawVal(q));
     if (!raw) raw = {attribuutit: a, propertySetit: psets, maaratiedot: qsets};
-    res.push({id, number: a.name ?? '', longName: a.longName ?? a.description ?? '', texts, nums});
+    res.push({gid: a.globalId ?? null, model: file.name, number: a.name ?? '', longName: a.longName ?? a.description ?? '', texts, nums});
   }
-  return {res, schema: store.schemaVersion, raw, errors: [...errors]};
+  return {name: file.name, res, schema: store.schemaVersion, raw, errors: [...errors]};
 }
 function keyStats(field) {
   const m = new Map();
   for (const s of spaces) for (const [k, v] of s[field]) { const o = m.get(k) || {n: 0, ex: v}; o.n++; m.set(k, o); }
   return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0]));
 }
+// Aiempi valinta säilytetään, jos kenttä löytyy edelleen (esim. kun lisätään toinen malli).
 function fillSelect(sel, field, prefer, emptyLabel) {
+  const prev = sel.value;
   const st = keyStats(field), keys = st.map(e => e[0]);
   sel.innerHTML = (emptyLabel ? '<option value="">' + esc(emptyLabel) + '</option>' : '') +
     st.map(([k, o]) => '<option value="' + esc(k) + '">' + esc(k) + ' (' + o.n + ' tilaa, esim. ' + esc(String(o.ex).slice(0, 30)) + ')</option>').join('');
+  if (prev && keys.includes(prev)) { sel.value = prev; return; }
   for (const re of prefer) { const hit = keys.find(k => re.test(k)); if (hit) { sel.value = hit; break; } }
 }
-function showDiag(r) {
+function showDiag() {
+  if (!models.length) { $('diagBox').style.display = 'none'; return; }
+  const errors = models.flatMap(m => m.errors.map(e => m.name + ': ' + e));
   const t = keyStats('texts'), n = keyStats('nums');
   const tab = (title, st) => '<h2>' + title + ' (' + st.length + ')</h2>' + (st.length
     ? '<table><tr><th>Kenttä</th><th class="n">Tiloja</th><th>Esimerkkiarvo</th></tr>' + st.map(([k, o]) =>
       '<tr><td>' + esc(k) + '</td><td class="n">' + o.n + '</td><td>' + esc(String(o.ex).slice(0, 80)) + '</td></tr>').join('') + '</table>'
     : '<p>Ei yhtään.</p>');
-  $('diagKeys').innerHTML = (r.errors.length ? '<p><b>Lukuvirheet:</b> ' + esc(r.errors.join(' | ')) + '</p>' : '') +
+  $('diagKeys').innerHTML = (errors.length ? '<p><b>Lukuvirheet:</b> ' + esc(errors.join(' | ')) + '</p>' : '') +
     tab('Numeeriset kentät (kelpaavat pinta-alaksi)', n) + tab('Tekstikentät (kelpaavat tilatunnukseksi)', t);
-  const rawTxt = safeJson(r.raw, 8000);
+  const rawTxt = safeJson(models[0].raw, 8000);
   $('diagRaw').textContent = rawTxt;
-  diagText = 'Skeema: ' + r.schema + '\nTiloja: ' + spaces.length + '\nVirheet: ' + r.errors.join(' | ') +
+  diagText = 'Mallit: ' + models.map(m => m.name + ' (' + m.schema + ', ' + m.res.length + ' tilaa)').join('; ') +
+    '\nTiloja yhteensä: ' + spaces.length + '\nVirheet: ' + errors.join(' | ') +
     '\n\nNUMEERISET:\n' + n.map(([k, o]) => k + ' (' + o.n + ') = ' + o.ex).join('\n') +
     '\n\nTEKSTIT:\n' + t.map(([k, o]) => k + ' (' + o.n + ') = ' + String(o.ex).slice(0, 80)).join('\n') +
-    '\n\nRAAKA:\n' + rawTxt;
+    '\n\nRAAKA (' + models[0].name + '):\n' + rawTxt;
   $('diagBox').style.display = '';
   if (!n.length) $('diagBox').open = true;
 }
 
+function clearOutput() {
+  for (const id of ['summary', 'areaBox', 'result', 'roomsTable', 'issues']) $(id).innerHTML = '';
+  $('csvBtn').disabled = true; last = null;
+}
 function compute() {
-  if (!spaces.length) return;
+  if (!spaces.length) { clearOutput(); return; }
   const sp = splitAreas(spaces, $('areaTerms').value);
   const areaKey = $('areaKey').value;
   last = programme.length ? computeComparison(programme, sp.rooms, $('codeKey').value, areaKey) : null;
@@ -312,7 +332,7 @@ function cls(p) { if (p == null) return ''; const a = Math.abs(p); return a <= 5
 function renderAreas(sp, areaKey) {
   if (!sp.areaCount) {
     $('areaBox').innerHTML = $('areaTerms').value.trim()
-      ? '<h2>Aluetilat (brutto- ja kerrosalat)</h2><p>Mallista ei löytynyt tiloja, joiden nimessä tai numerossa on jokin hakusanoista.</p>' : '';
+      ? '<h2>Aluetilat (brutto- ja kerrosalat)</h2><p>Malleista ei löytynyt tiloja, joiden nimessä tai numerossa on jokin hakusanoista.</p>' : '';
     return;
   }
   const hasArea = !!areaKey, levelKey = $('levelKey').value;
@@ -324,7 +344,7 @@ function renderAreas(sp, areaKey) {
   let h = '<h2>Aluetilat (brutto- ja kerrosalat), ' + sp.areaCount + ' tilaa</h2>' +
     '<table><tr><th>Ryhmä</th><th class="n">kpl</th><th class="n">Ala m²</th><th class="n">Tavoite m²</th><th class="n">Ero m²</th><th class="n">Ero %</th><th class="n">Huonetilat / ala</th><th class="n">Tilaohjelma / ala</th></tr>';
   sp.groups.forEach((g, i) => {
-    if (!g.spaces.length) { h += '<tr><td>' + esc(g.label) + '</td><td class="n">0</td><td colspan="6">Ei löytynyt mallista.</td></tr>'; return; }
+    if (!g.spaces.length) { h += '<tr><td>' + esc(g.label) + '</td><td class="n">0</td><td colspan="6">Ei löytynyt malleista.</td></tr>'; return; }
     const A = g.spaces.reduce((t, s) => t + ar(s), 0), T = targets[i] ?? null;
     const ep = (T != null && T) ? (A - T) / T * 100 : null;
     h += '<tr><td>' + esc(g.label) + '</td><td class="n">' + g.spaces.length + '</td><td class="n">' + (hasArea ? fmt(A) : '') +
@@ -332,29 +352,35 @@ function renderAreas(sp, areaKey) {
       '</td><td class="n ' + (hasArea ? cls(ep) : '') + '">' + (hasArea && ep != null ? sgn(ep, 1) + ' %' : '') +
       '</td><td class="n">' + (hasArea ? pct(H, A) : '') + '</td><td class="n">' + (hasArea && P != null ? pct(P, A) : '') + '</td></tr>';
   });
-  h += '</table><p class="hint">Huonetilat mallissa yhteensä ' + (hasArea ? fmt(H) + ' m²' : '(pinta-alakenttää ei ole valittu)') +
+  h += '</table><p class="hint">Huonetilat malleissa yhteensä ' + (hasArea ? fmt(H) + ' m²' : '(pinta-alakenttää ei ole valittu)') +
     (P != null ? ', tilaohjelman tavoiteala ' + fmt(P) + ' m²' : '') + '.</p>';
-  if (levelKey && hasArea) {
-    h += '<table style="width:auto"><tr><th>Ryhmä</th><th>Kerros</th><th class="n">kpl</th><th class="n">Ala m²</th></tr>';
+  if (hasArea) {
+    h += '<table style="width:auto"><tr><th>Ryhmä</th><th>Malli</th><th>Kerros</th><th class="n">kpl</th><th class="n">Ala m²</th></tr>';
     for (const g of sp.groups) {
       const m = new Map();
-      for (const s of g.spaces) { const k = s.texts.get(levelKey) ?? '(ei kerrosta)'; const o = m.get(k) || {n: 0, a: 0}; o.n++; o.a += ar(s); m.set(k, o); }
-      for (const [k, o] of [...m.entries()].sort((a, b) => a[0].localeCompare(b[0], 'fi', {numeric: true})))
-        h += '<tr><td>' + esc(g.label) + '</td><td>' + esc(k) + '</td><td class="n">' + o.n + '</td><td class="n">' + fmt(o.a) + '</td></tr>';
+      for (const s of g.spaces) {
+        const k = (s.model ?? '') + '\u0001' + (levelKey ? (s.texts.get(levelKey) ?? '(ei kerrosta)') : '');
+        const o = m.get(k) || {n: 0, a: 0}; o.n++; o.a += ar(s); m.set(k, o);
+      }
+      for (const [k, o] of [...m.entries()].sort((a, b) => a[0].localeCompare(b[0], 'fi', {numeric: true}))) {
+        const [mod, lev] = k.split('\u0001');
+        h += '<tr><td>' + esc(g.label) + '</td><td>' + esc(mod) + '</td><td>' + esc(lev) + '</td><td class="n">' + o.n + '</td><td class="n">' + fmt(o.a) + '</td></tr>';
+      }
     }
     h += '</table>';
   }
-  h += '<details><summary>Näytä aluetilat yksitellen</summary><table><tr><th>Ryhmä</th><th>Numero</th><th>Nimi mallissa</th><th>Kerros</th><th class="n">m²</th></tr>';
+  h += '<details><summary>Näytä aluetilat yksitellen</summary><table><tr><th>Ryhmä</th><th>Malli</th><th>Numero</th><th>Nimi mallissa</th><th>Kerros</th><th class="n">m²</th></tr>';
   for (const g of sp.groups)
     for (const s of g.spaces.slice().sort((a, b) => String(a.number).localeCompare(String(b.number), 'fi', {numeric: true})))
-      h += '<tr><td>' + esc(g.label) + '</td><td>' + esc(s.number) + '</td><td>' + esc(s.longName) + '</td><td>' +
+      h += '<tr><td>' + esc(g.label) + '</td><td>' + esc(s.model) + '</td><td>' + esc(s.number) + '</td><td>' + esc(s.longName) + '</td><td>' +
         esc(levelKey ? (s.texts.get(levelKey) ?? '') : '') + '</td><td class="n">' + (hasArea ? fmt(s.nums.get(areaKey)) : '') + '</td></tr>';
   $('areaBox').innerHTML = h + '</table></details>';
 }
 function render(x, sp) {
   const rows = x.rows, sumA = arr => arr.reduce((s, u) => s + (u.area ?? 0), 0);
   const noAreaKey = !$('areaKey').value;
-  $('summary').innerHTML = '<div class="box">Mallissa ' + spaces.length + ' tilaa (IfcSpace)' +
+  $('summary').innerHTML = '<div class="box">Malleja ' + models.length + ' (' + esc(models.map(m => m.name + ': ' + m.res.length + ' tilaa').join(', ')) +
+    '). Yhteensä ' + spaces.length + ' tilaa (IfcSpace)' +
     (sp.areaCount ? ', joista ' + sp.areaCount + ' aluetilaa (brutto- ja kerrosalat) on rajattu pois huonevertailusta' : '') +
     '. Huonetiloja on ' + sp.rooms.length + ', joista ' + rows[0].bimN +
     ' yhdistyi tilaohjelman riveihin (' + fmt(rows[0].bimA) + ' m²). Yhdistymättä jäi ' + (x.noCode.length + x.unknown.length) +
@@ -370,22 +396,21 @@ function render(x, sp) {
       '</td><td class="n ' + (noAreaKey ? '' : cls(r.erop)) + '">' + (noAreaKey || r.erop == null ? '' : sgn(r.erop, 1) + ' %') + '</td></tr>';
   }
   $('result').innerHTML = h + '</table><p>Värit: vihreä ≤ ±5 %, keltainen ≤ ±10 %, punainen yli ±10 %. Ero kpl korostetaan, jos määrä poikkeaa.</p>';
-  let t = '<h2>Vertailu huoneittain (' + x.roomRows.length + ')</h2><table><tr><th>Tilatunnus</th><th>Tilanimi</th><th>Huonenumero</th><th>Nimi mallissa</th><th class="n">Tav. m²</th><th class="n">BIM m²</th><th class="n">Ero m²</th><th class="n">Ero %</th></tr>';
+  let t = '<h2>Vertailu huoneittain (' + x.roomRows.length + ')</h2><table><tr><th>Tilatunnus</th><th>Tilanimi</th><th>Malli</th><th>Huonenumero</th><th>Nimi mallissa</th><th class="n">Tav. m²</th><th class="n">BIM m²</th><th class="n">Ero m²</th><th class="n">Ero %</th></tr>';
   for (const r of x.roomRows)
-    t += '<tr><td>' + esc(r.code) + '</td><td>' + esc(r.name) + '</td><td>' + esc(r.number) + '</td><td>' + esc(r.longName) +
+    t += '<tr><td>' + esc(r.code) + '</td><td>' + esc(r.name) + '</td><td>' + esc(r.model) + '</td><td>' + esc(r.number) + '</td><td>' + esc(r.longName) +
       '</td><td class="n">' + fmt(r.tav) + '</td><td class="n">' + fmt(r.area) + '</td><td class="n">' + sgn(r.ero) +
       '</td><td class="n ' + cls(r.erop) + '">' + (r.erop == null ? '' : sgn(r.erop, 1) + ' %') + '</td></tr>';
   $('roomsTable').innerHTML = t + '</table>';
   const list = (title, arr) => '<h2>' + esc(title) + ' (' + arr.length + ')</h2>' + (arr.length
-    ? '<table><tr><th>Huonenumero</th><th>Nimi</th><th>Tilatunnus</th><th class="n">m²</th></tr>' + arr.map(u =>
-      '<tr><td>' + esc(u.s.number) + '</td><td>' + esc(u.s.longName) + '</td><td>' + esc(u.code) + '</td><td class="n">' + fmt(u.area) + '</td></tr>').join('') + '</table>'
+    ? '<table><tr><th>Malli</th><th>Huonenumero</th><th>Nimi</th><th>Tilatunnus</th><th class="n">m²</th></tr>' + arr.map(u =>
+      '<tr><td>' + esc(u.s.model) + '</td><td>' + esc(u.s.number) + '</td><td>' + esc(u.s.longName) + '</td><td>' + esc(u.code) + '</td><td class="n">' + fmt(u.area) + '</td></tr>').join('') + '</table>'
     : '<p>Ei havaintoja.</p>');
   $('issues').innerHTML =
     list('Tilat ilman tilatunnusta', x.noCode) +
     list('Tilat, joiden tunnusta ei ole tilaohjelmassa', x.unknown) +
     (noAreaKey ? '' : list('Tilat ilman pinta-alaa valitussa kentässä', x.noArea));
   $('csvBtn').disabled = false;
-  status('Valmis.');
 }
 function exportCsv() {
   if (!last) return;
@@ -411,36 +436,59 @@ async function loadProgramme(f) {
     compute();
   } catch (err) { status('Virhe tilaohjelmassa: ' + err.message); }
 }
-async function loadIfc(f) {
-  try {
-    const r = await readIfc(f);
-    spaces = r.res;
-    $('ifcName').textContent = f.name;
-    fillSelect($('codeKey'), 'texts', [/tilatunnus/i, /tunnus/i]);
-    fillSelect($('areaKey'), 'nums', [/NetFloorArea$/i, /GrossFloorArea$/i, /^Dimensions\.Area$/i, /\.Area$/i, /\.Pinta-ala$/i, /area/i, /ala$/i], '(ei pinta-alaa, vain kappalemäärät)');
-    fillSelect($('levelKey'), 'texts', [/\.Level$/i, /kerros/i, /storey/i], '(ei kerrosjakoa)');
-    showDiag(r);
-    const hasNum = spaces.some(s => s.nums.size > 0);
-    status('Malli luettu (' + (r.schema ?? '') + '): ' + spaces.length + ' tilaa.' +
-      (spaces.length ? '' : ' Mallista ei löytynyt IfcSpace-tiloja.') +
-      (spaces.length && !hasNum ? '\nTiloilta ei löytynyt yhtään numeerista kenttää: IFC on viety ilman määrätietoja (Base Quantities). Pyydä arkkitehdilta vienti, jossa ne ovat mukana.' : '') +
-      (r.errors.length ? '\nLukuvirheitä: ' + r.errors.join(' | ') : ''));
-    compute();
-  } catch (err) { status('Virhe mallissa: ' + err.message); }
+// Mallit luetaan yksi kerrallaan ja lisätään listaan. Samanniminen malli korvaa aiemman.
+let loading = Promise.resolve();
+function loadIfcFiles(files) {
+  loading = loading.then(async () => {
+    const failed = [];
+    for (const f of files) {
+      try {
+        const m = await readIfc(f);
+        models = models.filter(x => x.name !== m.name);
+        models.push(m);
+      } catch (err) { failed.push(f.name + ': ' + err.message); }
+    }
+    refreshModels(failed);
+  });
+  return loading;
+}
+function refreshModels(failed) {
+  const merged = mergeModels(models);
+  spaces = merged.spaces;
+  $('ifcName').textContent = models.map(m => m.name + ' (' + m.res.length + ')').join(', ');
+  fillSelect($('codeKey'), 'texts', [/tilatunnus/i, /tunnus/i]);
+  fillSelect($('areaKey'), 'nums', [/NetFloorArea$/i, /GrossFloorArea$/i, /^Dimensions\.Area$/i, /\.Area$/i, /\.Pinta-ala$/i, /area/i, /ala$/i], '(ei pinta-alaa, vain kappalemäärät)');
+  fillSelect($('levelKey'), 'texts', [/\.Level$/i, /kerros/i, /storey/i], '(ei kerrosjakoa)');
+  showDiag();
+  const hasNum = spaces.some(s => s.nums.size > 0);
+  const errors = models.flatMap(m => m.errors.map(e => m.name + ': ' + e));
+  status((models.length
+      ? 'Malleja ladattu ' + models.length + ': ' + models.map(m => m.name + ' (' + (m.schema ?? '') + ', ' + m.res.length + ' tilaa)').join(', ') + '. Yhteensä ' + spaces.length + ' tilaa.'
+      : 'Ei ladattuja malleja.') +
+    (merged.dups ? '\nSama tila (sama GlobalId) oli useassa mallissa ' + merged.dups + ' kertaa. Ne laskettiin vain kerran.' : '') +
+    (models.length && !spaces.length ? '\nMalleista ei löytynyt IfcSpace-tiloja.' : '') +
+    (spaces.length && !hasNum ? '\nTiloilta ei löytynyt yhtään numeerista kenttää: IFC on viety ilman pinta-aloja. Pyydä arkkitehdilta vienti, jossa ne ovat mukana.' : '') +
+    (errors.length ? '\nLukuvirheitä: ' + errors.join(' | ') : '') +
+    (failed && failed.length ? '\nNäiden mallien luku epäonnistui: ' + failed.join(' | ') : ''));
+  compute();
 }
 async function handleFiles(files) {
   const list = Array.from(files || []);
   const ext = f => (f.name.split('.').pop() || '').toLowerCase();
-  const csv = list.find(f => ext(f) === 'csv' || ext(f) === 'txt');
-  const ifc = list.find(f => ext(f) === 'ifc');
-  const other = list.filter(f => f !== csv && f !== ifc).map(f => f.name);
-  if (csv) await loadProgramme(csv);
-  if (ifc) await loadIfc(ifc);
-  if (other.length) status($('status').textContent + '\nOhitettiin tiedostot, joiden tyyppiä ei tunnistettu: ' + other.join(', ') + '. Kelpaavat päätteet ovat .csv ja .ifc.');
+  const csvs = list.filter(f => ext(f) === 'csv' || ext(f) === 'txt');
+  const ifcs = list.filter(f => ext(f) === 'ifc');
+  const other = list.filter(f => !csvs.includes(f) && !ifcs.includes(f)).map(f => f.name);
+  if (csvs.length) await loadProgramme(csvs[0]);
+  if (ifcs.length) await loadIfcFiles(ifcs);
+  const notes = [];
+  if (csvs.length > 1) notes.push('Tilaohjelmia voi olla vain yksi. Käytettiin tiedostoa ' + csvs[0].name + ', ohitettiin: ' + csvs.slice(1).map(f => f.name).join(', ') + '.');
+  if (other.length) notes.push('Ohitettiin tiedostot, joiden tyyppiä ei tunnistettu: ' + other.join(', ') + '. Kelpaavat päätteet ovat .csv ja .ifc.');
+  if (notes.length) status($('status').textContent + '\n' + notes.join('\n'));
 }
 
 $('progFile').addEventListener('change', e => { const f = e.target.files[0]; if (f) loadProgramme(f); });
-$('ifcFile').addEventListener('change', e => { const f = e.target.files[0]; if (f) loadIfc(f); });
+$('ifcFile').addEventListener('change', e => { const fs = Array.from(e.target.files); e.target.value = ''; if (fs.length) loadIfcFiles(fs); });
+$('clearBtn').addEventListener('click', () => { loading = loading.then(() => { models = []; refreshModels([]); }); });
 for (const id of ['codeKey', 'areaKey', 'levelKey']) $(id).addEventListener('change', compute);
 for (const id of ['areaTerms', 'areaTargets']) $(id).addEventListener('input', compute);
 $('csvBtn').addEventListener('click', exportCsv);
